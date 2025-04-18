@@ -1,0 +1,35 @@
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index ff2536487..7caff2327 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -1422,6 +1422,18 @@ void mark_rodata_ro(void)
+ /* Amount of ram needed to start using large blocks */
+ #define MEM_SIZE_FOR_LARGE_BLOCK (64UL << 30)
+ 
++static unsigned long mem_block_size_order __initdata = 27;
++
++/* Kernel parameter to specify mem block size order */
++static int __init parse_mem_block_size_order(char *ptr)
++{
++	unsigned long order = memparse(ptr, NULL);
++
++	mem_block_size_order = order;
++	return 0;
++}
++early_param("memblksizeorder", parse_mem_block_size_order);
++
+ /* Adjustable memory block size */
+ static unsigned long set_memory_block_size;
+ int __init set_memory_block_size_order(unsigned int order)
+@@ -1474,8 +1486,10 @@ static unsigned long probe_memory_block_size(void)
+ static unsigned long memory_block_size_probed;
+ unsigned long memory_block_size_bytes(void)
+ {
+-	if (!memory_block_size_probed)
++	if (!memory_block_size_probed) {
++		set_memory_block_size_order(mem_block_size_order);
+ 		memory_block_size_probed = probe_memory_block_size();
++	}
+ 
+ 	return memory_block_size_probed;
+ }
