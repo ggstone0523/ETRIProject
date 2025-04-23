@@ -1,12 +1,12 @@
 diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
-index ff2536487..7caff2327 100644
+index ff2536487..c5eb5d9c2 100644
 --- a/arch/x86/mm/init_64.c
 +++ b/arch/x86/mm/init_64.c
 @@ -1422,6 +1422,18 @@ void mark_rodata_ro(void)
  /* Amount of ram needed to start using large blocks */
  #define MEM_SIZE_FOR_LARGE_BLOCK (64UL << 30)
  
-+static unsigned long mem_block_size_order __initdata = 27;
++static unsigned long mem_block_size_order = 27;
 +
 +/* Kernel parameter to specify mem block size order */
 +static int __init parse_mem_block_size_order(char *ptr)
