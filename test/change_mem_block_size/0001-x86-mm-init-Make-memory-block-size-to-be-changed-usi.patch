@@ -1,4 +1,4 @@
-From d89ded12eee63e396fca9d523ba285a066c9ff6f Mon Sep 17 00:00:00 2001
+From 1546564999f289cfca8074e139550d8768cb0e22 Mon Sep 17 00:00:00 2001
 From: Yusun Choi <tanks2438@outlook.kr>
 Date: Wed, 23 Apr 2025 20:41:21 +0900
 Subject: [PATCH] x86/mm/init: Make memory block size to be changed using
@@ -10,14 +10,14 @@ Signed-off-by: Yusun Choi <tanks2438@outlook.kr>
  1 file changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
-index ff2536487..c5eb5d9c2 100644
+index ff2536487..0c9cf14a1 100644
 --- a/arch/x86/mm/init_64.c
 +++ b/arch/x86/mm/init_64.c
 @@ -1422,6 +1422,18 @@ void mark_rodata_ro(void)
  /* Amount of ram needed to start using large blocks */
  #define MEM_SIZE_FOR_LARGE_BLOCK (64UL << 30)
  
-+static unsigned long mem_block_size_order = 27;
++static unsigned long mem_block_size_order = SECTION_SIZE_BITS;
 +
 +/* Kernel parameter to specify mem block size order */
 +static int __init parse_mem_block_size_order(char *ptr)
