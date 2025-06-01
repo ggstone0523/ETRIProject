@@ -1,0 +1,293 @@
+From 7a7332578414859964adefbdfc56a892c71158f0 Mon Sep 17 00:00:00 2001
+From: Yusun Choi <tanks2438@outlook.kr>
+Date: Sun, 1 Jun 2025 12:12:27 +0900
+Subject: [PATCH] mm/memblock: Generalize UV-specific memory block size setup
+
+Previously, the UV platform implemented its own "uv_memblksize=" boot parameter
+to control the memory block size used for memory hotplug. This logic was tightly
+coupled to UV-specific code in x2apic_uv_x.c.
+
+This patch extracts and generalizes the memory block size setup logic,
+introducing a new boot parameter "memblksize=" to configure the memory block size
+for memory hotplug. The parsing and initialization logic is moved to a new file,
+mm/memblock_setup.c, with a corresponding header under include/linux.
+
+The legacy "uv_memblksize=" parameter is retained for backward compatibility,
+allowing existing tooling and scripts to continue functioning without change.
+
+Allowing the memory block size to be set at early boot enables greater flexibility
+for systems that use memory hotplug later in their lifecycle, accommodating
+various hardware and platform requirements more easily.
+
+Note: Although the "memblksize=" parameter is now accepted on all platforms,
+its actual effect depends on whether the platform implements
+`set_memory_block_size_order()`. As of now, only x86 defines this function;
+on other platforms, the weak stub will silently ignore the value.
+
+Key changes:
+- Introduce memblock_setup.c for early boot-time configuration of memory block size.
+- Add a generic "memblksize=" kernel parameter.
+- Preserve the existing "uv_memblksize=" parameter for legacy support.
+- UV platforms continue to default to a 2GB block size; on other platforms,
+  the default is defined as MIN_MEMORY_BLOCK_SIZE (typically 128MB),
+  unless overridden.
+- Refactor set_block_size() to be reusable across platforms that implement the required hook.
+
+This refactoring improves code reuse and provides a generic mechanism for
+memory hotplug block sizing, with platform support to follow as needed.
+
+Signed-off-by: Yusun Choi <tanks2438@outlook.kr>
+---
+ arch/x86/kernel/apic/x2apic_uv_x.c | 41 ++++++++------------
+ drivers/base/memory.c              |  8 ++++
+ include/linux/memblock_setup.h     | 34 +++++++++++++++++
+ mm/Makefile                        |  1 +
+ mm/memblock_setup.c                | 61 ++++++++++++++++++++++++++++++
+ 5 files changed, 119 insertions(+), 26 deletions(-)
+ create mode 100644 include/linux/memblock_setup.h
+ create mode 100644 mm/memblock_setup.c
+
+diff --git a/arch/x86/kernel/apic/x2apic_uv_x.c b/arch/x86/kernel/apic/x2apic_uv_x.c
+index 7fef504ca..df73991b0 100644
+--- a/arch/x86/kernel/apic/x2apic_uv_x.c
++++ b/arch/x86/kernel/apic/x2apic_uv_x.c
+@@ -13,6 +13,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/proc_fs.h>
+ #include <linux/memory.h>
++#include <linux/memblock_setup.h>
+ #include <linux/export.h>
+ #include <linux/pci.h>
+ #include <linux/acpi.h>
+@@ -526,19 +527,11 @@ static __initdata struct uv_gam_range_s		*_gr_table;
+ 
+ #define	SOCK_EMPTY	((unsigned short)~0)
+ 
+-/* Default UV memory block size is 2GB */
+-static unsigned long mem_block_size __initdata = (2UL << 30);
+-
+-/* Kernel parameter to specify UV mem block size */
+-static int __init parse_mem_block_size(char *ptr)
++static int __init parse_uv_mem_block_size(char *ptr)
+ {
+-	unsigned long size = memparse(ptr, NULL);
+-
+-	/* Size will be rounded down by set_block_size() below */
+-	mem_block_size = size;
+-	return 0;
++	return parse_mem_block_size(ptr);
+ }
+-early_param("uv_memblksize", parse_mem_block_size);
++early_param("uv_memblksize", parse_uv_mem_block_size);
+ 
+ static __init int adj_blksize(u32 lgre)
+ {
+@@ -556,21 +549,6 @@ static __init int adj_blksize(u32 lgre)
+ 	return 1;
+ }
+ 
+-static __init void set_block_size(void)
+-{
+-	unsigned int order = ffs(mem_block_size);
+-
+-	if (order) {
+-		/* adjust for ffs return of 1..64 */
+-		set_memory_block_size_order(order - 1);
+-		pr_info("UV: mem_block_size set to 0x%lx\n", mem_block_size);
+-	} else {
+-		/* bad or zero value, default to 1UL << 31 (2GB) */
+-		pr_err("UV: mem_block_size error with 0x%lx\n", mem_block_size);
+-		set_memory_block_size_order(31);
+-	}
+-}
+-
+ /* Build GAM range lookup table: */
+ static __init void build_uv_gr_table(void)
+ {
+@@ -1614,6 +1592,15 @@ static __init void uv_setup_proc_files(int hubless)
+ 		proc_create_single("hubbed", 0, pde, proc_hubbed_show);
+ }
+ 
++static __init void setup_init_memblk_size(void)
++{
++	/* Default UV memory block size is 2GB */
++	if (!mem_block_size_user_specified)
++		mem_block_size = (2UL << 30);
++
++	mem_block_size_user_specified = false;
++}
++
+ /* Initialize UV hubless systems */
+ static __init int uv_system_init_hubless(void)
+ {
+@@ -1633,6 +1620,7 @@ static __init int uv_system_init_hubless(void)
+ 		return rc;
+ 
+ 	/* Set section block size for current node memory */
++	setup_init_memblk_size();
+ 	set_block_size();
+ 
+ 	/* Create user access node */
+@@ -1674,6 +1662,7 @@ static void __init uv_system_init_hub(void)
+ 
+ 	build_socket_tables();
+ 	build_uv_gr_table();
++	setup_init_memblk_size();
+ 	set_block_size();
+ 	uv_init_hub_info(&hub_info);
+ 	/* If UV2 or UV3 may need to get # blades from HW */
+diff --git a/drivers/base/memory.c b/drivers/base/memory.c
+index 67858eeb9..41076540d 100644
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -17,6 +17,7 @@
+ #include <linux/capability.h>
+ #include <linux/device.h>
+ #include <linux/memory.h>
++#include <linux/memblock_setup.h>
+ #include <linux/memory_hotplug.h>
+ #include <linux/mm.h>
+ #include <linux/stat.h>
+@@ -116,6 +117,11 @@ unsigned long __weak memory_block_size_bytes(void)
+ }
+ EXPORT_SYMBOL_GPL(memory_block_size_bytes);
+ 
++int __weak set_memory_block_size_order(unsigned int order)
++{
++	return 0;
++}
++
+ /* Show the memory block ID, relative to the memory block size */
+ static ssize_t phys_index_show(struct device *dev,
+ 			       struct device_attribute *attr, char *buf)
+@@ -965,6 +971,8 @@ void __init memory_dev_init(void)
+ 	unsigned long block_sz, nr;
+ 
+ 	/* Validate the configured memory block size */
++	if(mem_block_size_user_specified)
++		set_block_size();
+ 	block_sz = memory_block_size_bytes();
+ 	if (!is_power_of_2(block_sz) || block_sz < MIN_MEMORY_BLOCK_SIZE)
+ 		panic("Memory block size not suitable: 0x%lx\n", block_sz);
+diff --git a/include/linux/memblock_setup.h b/include/linux/memblock_setup.h
+new file mode 100644
+index 000000000..a102c2d3b
+--- /dev/null
++++ b/include/linux/memblock_setup.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * memblock_setup.h - Memory block size configuration for memory hotplug
++ *
++ * This header declares the interface for early boot-time configuration of the
++ * memory block size used in memory hotplug operations via the "memblksize="
++ * kernel parameter. It generalizes and extracts logic originally developed
++ * for SGI UV systems.
++ *
++ * This code is adapted from SGI UV-specific logic originally located in:
++ *   arch/x86/kernel/apic/x2apic_uv_x.c
++ *
++ * Original Authors:
++ *   (C) Copyright 2020 Hewlett Packard Enterprise Development LP
++ *   Copyright (C) 2007-2014 Silicon Graphics, Inc. All rights reserved.
++ *
++ * Modified by: Yusun Choi
++ */
++
++#ifndef _LINUX_MEMBLOCK_SETUP_H
++#define _LINUX_MEMBLOCK_SETUP_H
++
++#include <linux/types.h>
++
++/* Memory block size used for hotplug memory alignment */
++extern unsigned long mem_block_size;
++/* True if user specified mem_block_size via kernel parameter */
++extern bool mem_block_size_user_specified;
++
++int parse_mem_block_size(char *str);
++void set_block_size(void);
++
++#endif /* _LINUX_MEMBLOCK_SETUP_H */
++
+diff --git a/mm/Makefile b/mm/Makefile
+index d2915f8c9..1716956da 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -67,6 +67,7 @@ memory-hotplug-$(CONFIG_MEMORY_HOTPLUG) += memory_hotplug.o
+ obj-y += page-alloc.o
+ obj-y += init-mm.o
+ obj-y += memblock.o
++obj-y += memblock_setup.o
+ obj-y += $(memory-hotplug-y)
+ obj-y += slub.o
+ 
+diff --git a/mm/memblock_setup.c b/mm/memblock_setup.c
+new file mode 100644
+index 000000000..6801f90fb
+--- /dev/null
++++ b/mm/memblock_setup.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * memblock_setup.c - Early memory block size configuration for memory hotplug
++ *
++ * This file provides an early boot-time mechanism to configure memory block
++ * size via the "memblksize=" kernel boot parameter. This allows platforms to
++ * customize the granularity of memory hotplug operations.
++ *
++ * This code is adapted from SGI UV-specific logic originally located in:
++ *   arch/x86/kernel/apic/x2apic_uv_x.c
++ *
++ * Original Authors:
++ *   (C) Copyright 2020 Hewlett Packard Enterprise Development LP
++ *   Copyright (C) 2007-2014 Silicon Graphics, Inc. All rights reserved.
++ *
++ * Modifications:
++ *   - Extracted memblksize= parsing logic
++ *   - Generalized for non-UV systems
++ *   - Relocated to generic memory setup path (memblock)
++ *
++ * Modified by: Yusun Choi
++ */
++
++#include <linux/memblock_setup.h>
++#include <linux/memblock.h>
++#include <linux/memory.h>
++#include <linux/log2.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++
++unsigned long mem_block_size = MIN_MEMORY_BLOCK_SIZE;
++bool mem_block_size_user_specified = false;
++
++int __init parse_mem_block_size(char *ptr)
++{
++	unsigned long size = memparse(ptr, NULL);
++
++	if (!is_power_of_2(size)) {
++		pr_warn("Invailed memblksize: %s\n", ptr);
++		return 0;
++	}
++	mem_block_size = size;
++	mem_block_size_user_specified = true;
++	return 0;
++}
++early_param("memblksize", parse_mem_block_size);
++
++void __init set_block_size(void)
++{
++	unsigned int order = ffs(mem_block_size);
++
++	if(order) {
++		/* adjust for ffs return of 1..64 */
++		set_memory_block_size_order(order - 1);
++		pr_info("mem_block_size set to 0x%lx\n", mem_block_size);
++	} else {
++		/* bad or zero value, default to SECTION_SIZE_BITS*/
++		pr_err("mem_block_size error with 0x%lx\n", mem_block_size);
++		set_memory_block_size_order(SECTION_SIZE_BITS);
++	}
++}
+-- 
+2.34.1
+
